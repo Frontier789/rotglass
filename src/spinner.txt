@@ -1,0 +1,493 @@
+#![allow(dead_code)]
+extern crate gl;
+extern crate glui;
+extern crate glui_proc;
+extern crate rand;
+
+use glui::graphics::{DrawResources, RenderCommand, RenderSequence};
+use glui::mecs::world::UiEvent;
+use glui::mecs::*;
+use glui::tools;
+use glui::tools::*;
+use rand::Rng;
+use std::collections::HashMap;
+use std::ops::{Add, Mul};
+use std::time::{Duration, Instant};
+
+#[derive(Debug, Component)]
+struct DrawComponent {
+    pub render_seq: RenderSequence,
+    pub model_matrix: Mat4,
+}
+
+struct DrawSystem {
+    pub camera: Camera,
+    pub resources: DrawResources,
+}
+
+impl System for DrawSystem {
+    fn receive(&mut self, msg: &Box<dyn Message>, world: &mut StaticWorld) {
+        if let Some(ui_event) = msg.downcast_ref::<UiEvent>() {
+            self.camera.on_event(ui_event);
+
+            match ui_event {
+                UiEvent::Redraw => {
+                    // println!("received redraw at {:?}", Instant::now());
+                    self.render(world);
+                }
+                UiEvent::WindowEvent(ref ev) => {
+                    if let GlutinWindowEvent::Resized(s) = ev {
+                        self.resources.window_info.size =
+                            Vec2::new(s.width as f32, s.height as f32);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if let Some(message::Update(dt)) = msg.downcast_ref() {
+            self.camera.update(*dt);
+        }
+    }
+}
+
+impl DrawSystem {
+    fn render(&mut self, world: &mut StaticWorld) {
+        let mut es = vec![];
+        for (e, c) in world.entities_with_component::<DrawComponent>() {
+            self.resources.model_matrix = c.model_matrix;
+            es.push((e, (c.model_matrix * Vec4::origin()).z));
+        }
+
+        es.sort_by(|(_, d1), (_, d2)| d1.partial_cmp(d2).unwrap());
+
+        for (e, _) in es {
+            let c = world.component::<DrawComponent>(e).unwrap();
+            self.resources.model_matrix = c.model_matrix;
+            self.camera
+                .render_to_screen(&c.render_seq, &mut self.resources);
+        }
+
+        // for (_, component) in world.entities_with_component::<DrawComponent>() {
+        //     self.resources.model_matrix = component.model_matrix;
+        //     self.camera
+        //         .render_to_screen(&component.render_seq, &mut self.resources);
+        // }
+    }
+}
+
+#[derive(Debug, Copy, Clone)]
+enum Projection {
+    Perspective,
+    Orthogonal,
+}
+
+struct CameraParameters {
+    pub pos: Vec3,
+    pub target: Vec3,
+    pub up: Vec3,
+    pub fov: f32,
+    pub texel_scale: f32,
+    pub znear: f32,
+    pub zfar: f32,
+    pub projection: Projection,
+}
+
+impl CameraParameters {
+    pub fn l(&self) -> Vec3 {
+        self.up.cross(self.v()).sgn()
+    }
+    pub fn u(&self) -> Vec3 {
+        self.v().cross(self.l()).sgn()
+    }
+    pub fn v(&self) -> Vec3 {
+        (self.target - self.pos).sgn()
+    }
+    pub fn move_to(&mut self, pos: Vec3) {
+        let d = pos - self.pos;
+        self.pos = pos;
+        self.target += d;
+    }
+    pub fn move_by(&mut self, offset: Vec3) {
+        self.pos += offset;
+        self.target += offset;
+    }
+    pub fn view_mat(&self) -> Mat4 {
+        Mat4::look_at(self.pos, self.target, self.up)
+    }
+}
+
+trait CameraController {
+    fn on_event(&mut self, _cam: &mut CameraParameters, _event: &UiEvent) {}
+    fn update(&mut self, _cam: &mut CameraParameters, _delta: Duration) {}
+}
+
+struct NoController {}
+
+impl CameraController for NoController {}
+
+struct TestController {
+    speed: f32,
+    pressed: HashMap<GlutinKey, bool>,
+    velocity: Vec3,
+}
+
+impl CameraController for TestController {
+    fn on_event(&mut self, _cam: &mut CameraParameters, event: &UiEvent) {
+        match event {
+            UiEvent::DeviceEvent(GlutinDeviceEvent::Key(input)) => match input.state {
+                GlutinElementState::Pressed => {
+                    if let Some(keycode) = input.virtual_keycode {
+                        if !*self.pressed.get(&keycode).unwrap_or(&false) {
+                            // println!("Registered keypress at {:?}", Instant::now());
+                            self.update_velocity(keycode, 1.0);
+                            self.pressed.insert(keycode, true);
+                        }
+                    }
+                }
+                GlutinElementState::Released => {
+                    if let Some(keycode) = input.virtual_keycode {
+                        self.update_velocity(keycode, -1.0);
+                        self.pressed.insert(keycode, false);
+                    }
+                }
+            },
+            _ => {}
+        }
+    }
+    fn update(&mut self, cam: &mut CameraParameters, delta: Duration) {
+        // println!("Updated at {:?}", Instant::now());
+        let v =
+            self.velocity.z * cam.v() + self.velocity.y * cam.u() + self.velocity.x * (-cam.l());
+        cam.move_by(v * self.speed * delta.as_secs_f32());
+    }
+}
+impl TestController {
+    pub fn update_velocity(&mut self, keycode: GlutinKey, speed: f32) {
+        if keycode == GlutinKey::W {
+            self.velocity.z += speed;
+        }
+        if keycode == GlutinKey::A {
+            self.velocity.x -= speed;
+        }
+        if keycode == GlutinKey::S {
+            self.velocity.z -= speed;
+        }
+        if keycode == GlutinKey::D {
+            self.velocity.x += speed;
+        }
+        if keycode == GlutinKey::Space {
+            self.velocity.y += speed;
+        }
+        if keycode == GlutinKey::LShift {
+            self.velocity.y -= speed;
+        }
+    }
+}
+
+impl TestController {
+    pub fn new(speed: f32) -> TestController {
+        TestController {
+            speed,
+            pressed: HashMap::new(),
+            velocity: Vec3::zero(),
+        }
+    }
+}
+
+struct Camera {
+    fbo: Framebuffer,
+    pub params: CameraParameters,
+    pub controller: Box<dyn CameraController>,
+}
+
+fn aspect(size: (usize, usize)) -> f32 {
+    size.0 as f32 / size.1 as f32
+}
+
+// TODO: handle orthogonal projection
+impl Camera {
+    pub fn update(&mut self, delta: Duration) {
+        self.controller.update(&mut self.params, delta);
+    }
+    pub fn on_event(&mut self, event: &UiEvent) {
+        self.controller.on_event(&mut self.params, event);
+    }
+    pub fn new() -> Camera {
+        Camera {
+            fbo: Framebuffer::new(),
+            params: CameraParameters {
+                pos: Vec3::origin(),
+                target: Vec3::new(0.0, 0.0, -1.0),
+                up: Vec3::new(0.0, 1.0, 0.0),
+                projection: Projection::Perspective,
+                fov: std::f32::consts::PI * 0.5,
+                texel_scale: 1.0,
+                znear: 0.1,
+                zfar: 100.0,
+            },
+            controller: Box::new(TestController::new(1.0)),
+        }
+    }
+
+    pub fn proj(&self, aspect_ratio: f32) -> Mat4 {
+        Mat4::perspective(
+            self.params.fov,
+            aspect_ratio,
+            self.params.znear,
+            self.params.zfar,
+        )
+    }
+
+    pub fn view(&self) -> Mat4 {
+        self.params.view_mat()
+    }
+
+    pub fn render_to_texture<T>(
+        &mut self,
+        tex: &mut T,
+        seq: &RenderSequence,
+        res: &mut DrawResources,
+    ) where
+        T: Texture,
+    {
+        self.fbo
+            .attach_texture(FrameBufferAttachment::Color(0), tex);
+        self.fbo
+            .set_draw_targets(vec![FrameBufferAttachment::Color(0)]);
+        self.fbo.bind();
+        unsafe {
+            gl::Disable(gl::DEPTH_TEST);
+        }
+        res.projection_matrix = self.proj(aspect(tex.size_2d()));
+        res.view_matrix = self.view();
+        seq.execute(res);
+    }
+
+    pub fn render_to_screen(&mut self, seq: &RenderSequence, res: &mut DrawResources) {
+        Framebuffer::bind_def_framebuffer(Some(res.window_info.size));
+        res.projection_matrix = self.proj(res.window_info.size.aspect());
+        res.view_matrix = self.view();
+        seq.execute(res);
+    }
+}
+
+fn square(tex_id: u32) -> RenderSequence {
+    let pts = tools::parsurf(|x, y| Vec3::new(x, y, 0.0), 1, 1);
+    let clr = tools::parsurf(|_, _| Vec4::WHITE, 1, 1);
+    let tpt = tools::parsurf(|x, y| Vec2::new(x, y), 1, 1);
+
+    let pts_count = pts.len();
+    let pbuf = Buffer::from_vec(pts);
+    let cbuf = Buffer::from_vec(clr);
+    let tbuf = Buffer::from_vec(tpt);
+    let mut vao = VertexArray::new();
+    vao.attrib_buffer(0, &pbuf);
+    vao.attrib_buffer(1, &cbuf);
+    vao.attrib_buffer(2, &tbuf);
+
+    let mut render_seq = RenderSequence::new();
+
+    render_seq.add_buffer(pbuf.into_base_type());
+    render_seq.add_buffer(cbuf.into_base_type());
+    render_seq.add_buffer(tbuf.into_base_type());
+
+    render_seq.add_command(RenderCommand {
+        vao,
+        mode: DrawMode::Triangles,
+        first: 0,
+        count: pts_count,
+        shader: "tex_shader".to_owned(),
+        uniforms: vec![Uniform::Texture2D("tex".to_owned(), tex_id)],
+        transparent: true,
+    });
+
+    render_seq
+}
+
+struct Interpolation<T>
+where
+    T: Copy,
+{
+    current: T,
+    target: T,
+    begin: T,
+    transition_time: Duration,
+    spent_time: Duration,
+}
+
+impl<T> Interpolation<T>
+where
+    T: Copy + Mul<f32, Output = T> + Add<T, Output = T>,
+{
+    pub fn new(val: T, transition_time: Duration) -> Interpolation<T> {
+        Interpolation {
+            current: val,
+            target: val,
+            begin: val,
+            transition_time,
+            spent_time: Default::default(),
+        }
+    }
+
+    pub fn target(&mut self, val: T) {
+        self.target = val;
+        self.begin = self.current;
+        self.spent_time = Default::default();
+    }
+
+    pub fn update(&mut self, delta: Duration) {
+        if self.spent_time < self.transition_time {
+            self.spent_time += delta;
+
+            if self.spent_time > self.transition_time {
+                self.spent_time = self.transition_time;
+            }
+
+            let ratio = self.spent_time.as_secs_f64() / self.transition_time.as_secs_f64();
+
+            self.current = self.begin * (1.0 - ratio as f32) + self.target * ratio as f32;
+        }
+    }
+
+    pub fn current(&self) -> T {
+        self.current
+    }
+    pub fn current_mut(&mut self) -> &mut T {
+        &mut self.current
+    }
+}
+
+struct SpinActor {
+    wheel: Entity,
+    spinner: Entity,
+    spinner_small: Entity,
+    rot: Interpolation<f32>,
+    rot_small: Interpolation<f32>,
+}
+
+impl Actor for SpinActor {
+    fn receive(&mut self, msg: &Box<dyn Message>, world: &mut StaticWorld) {
+        if let Some(message::Update(dt)) = msg.downcast_ref() {
+            self.rot.update(*dt);
+            self.rot_small.update(*dt);
+
+            self.apply_rotation(world);
+        }
+        if let Some(UiEvent::WindowEvent(ref ev)) = msg.downcast_ref() {
+            match ev {
+                GlutinWindowEvent::KeyboardInput { input, .. } => {
+                    if let Some(GlutinKey::R) = input.virtual_keycode {
+                        if input.state == GlutinElementState::Pressed {
+                            let mut i = 2;
+                            while i == 2 || i == 10 {
+                                i = rand::thread_rng().gen_range(0, 12);
+                            }
+
+                            let mut j = 2;
+                            while j == 2 || j == 10 {
+                                j = rand::thread_rng().gen_range(0, 12);
+                            }
+
+                            let t = rand::thread_rng().gen_range(1, 12);
+                            *self.rot.current_mut() %= 2.0 * std::f32::consts::PI;
+                            *self.rot_small.current_mut() %= 2.0 * std::f32::consts::PI;
+
+                            self.rot
+                                .target((i + 12 * t) as f32 / 12.0 * 2.0 * std::f32::consts::PI);
+                            self.rot_small
+                                .target((j + 12 * t) as f32 / 12.0 * 2.0 * std::f32::consts::PI);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+impl SpinActor {
+    pub fn new(world: &mut World) -> SpinActor {
+        let draw_sys = world.system_mut::<DrawSystem>().unwrap();
+        let draw_res = &mut draw_sys.resources;
+        let wheel_tex = draw_res.texture_id("images/wheel").unwrap();
+        let spinner_tex = draw_res.texture_id("images/spinner").unwrap();
+        let spinner_small_tex = draw_res.texture_id("images/spinner_small").unwrap();
+
+        let wheel = world.as_static_mut().entity();
+
+        world.as_static_mut().add_component(
+            wheel,
+            DrawComponent {
+                render_seq: square(wheel_tex),
+                model_matrix: Mat4::SCALE(2.0) * Mat4::offset(Vec3::new(-0.5, -0.5, 0.0)),
+            },
+        );
+
+        let spinner = world.as_static_mut().entity();
+
+        world.as_static_mut().add_component(
+            spinner,
+            DrawComponent {
+                render_seq: square(spinner_tex),
+                model_matrix: Mat4::SCALE(2.0) * Mat4::offset(Vec3::new(-0.5, -0.5, 0.1)),
+            },
+        );
+
+        let spinner_small = world.as_static_mut().entity();
+
+        world.as_static_mut().add_component(
+            spinner_small,
+            DrawComponent {
+                render_seq: square(spinner_small_tex),
+                model_matrix: Mat4::SCALE(2.0) * Mat4::offset(Vec3::new(-0.5, -0.5, 0.1)),
+            },
+        );
+
+        SpinActor {
+            wheel,
+            spinner,
+            spinner_small,
+            rot: Interpolation::new(0.0, Duration::from_secs_f32(3.0)),
+            rot_small: Interpolation::new(0.0, Duration::from_secs_f32(3.0)),
+        }
+    }
+
+    pub fn apply_rotation(&mut self, w: &mut StaticWorld) {
+        let d = w.component_mut::<DrawComponent>(self.spinner).unwrap();
+
+        d.model_matrix = Mat4::rotate_z(self.rot.current())
+            * Mat4::SCALE(2.0)
+            * Mat4::offset(Vec3::new(-0.5, -0.5, 0.1));
+
+        let d = w
+            .component_mut::<DrawComponent>(self.spinner_small)
+            .unwrap();
+
+        d.model_matrix = Mat4::rotate_z(self.rot_small.current())
+            * Mat4::SCALE(2.0)
+            * Mat4::offset(Vec3::new(-0.5, -0.5, 0.1));
+    }
+}
+
+fn main() {
+    let mut w: World = World::new_win(Vec2::new(640.0, 480.0), "Vmodel", Vec3::grey(0.1));
+
+    let mut draw_res = DrawResources::new(w.window_info().unwrap());
+    draw_res.create_defaults().unwrap();
+
+    let mut ds = DrawSystem {
+        camera: Camera::new(),
+        resources: draw_res,
+    };
+
+    ds.camera.params.pos = Vec3::new(0.0, 0.0, 1.0);
+
+    let dsid = w.add_system(ds);
+    w.make_system_ui_aware(dsid);
+
+    let spin = SpinActor::new(&mut w);
+    let id = w.add_actor(spin);
+    w.make_actor_ui_aware(id);
+
+    w.run();
+}
