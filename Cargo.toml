@@ -7,6 +7,6 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-glui = { path = "../glui" }
-glui_proc = { path = "../glui_proc" }
+glui = { git = "https://github.com/Frontier789/glui" }
+glui_proc = { git = "https://github.com/Frontier789/glui_proc" }
 gl = "*"
